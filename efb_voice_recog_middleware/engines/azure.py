@@ -40,7 +40,7 @@ class AzureSpeech(SpeechEngine):
                 return i
         return None
 
-    def __init__(self, keys: Dict[str, str]):
+    def __init__(self, keys: Dict[str, str], timeout: float = 20):
         """
         Arguments:
             keys {Dict[str, str]} -- authorization keys
@@ -54,6 +54,7 @@ class AzureSpeech(SpeechEngine):
             'conversation/cognitiveservices/v1'
         )
         self.lang = keys.get('lang', 'zh-CN')
+        self.timeout = timeout
 
     def recognize(self, path: PathLike, lang: str = ""):
         if not lang:
@@ -81,7 +82,13 @@ class AzureSpeech(SpeechEngine):
                 "format": "detailed",
             }
             f.seek(0)
-            r = requests.post(self.endpoint, params=d, data=f, headers=header)
+            r = requests.post(
+                self.endpoint,
+                params=d,
+                data=f,
+                headers=header,
+                timeout=self.timeout,
+            )
 
             try:
                 rjson = r.json()

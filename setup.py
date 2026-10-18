@@ -40,6 +40,7 @@ setup(
         "ehforwarderbot>=2.0.0b5",
         "PyYaml",
         "pydub>=0.23.1",
+        "requests",
         "tencentcloud-sdk-python",
         "websocket_client >= 0.59.0"
     ],

@@ -25,7 +25,7 @@ class TencentSpeech(SpeechEngine):
         "ca": "16k_ca"
     }
 
-    def __init__(self, keys: Dict[str, str]):
+    def __init__(self, keys: Dict[str, str], timeout: float = 20):
         """
         Arguments:
             keys {Dict[str, str]} -- authorization keys
@@ -34,11 +34,13 @@ class TencentSpeech(SpeechEngine):
         cred = credential.Credential(keys['secret_id'], keys['secret_key'])
         httpProfile = HttpProfile()
         httpProfile.endpoint = "asr.tencentcloudapi.com"
+        httpProfile.reqTimeout = timeout
         clientProfile = ClientProfile()
         clientProfile.httpProfile = httpProfile
         clientProfile.signMethod = "TC3-HMAC-SHA256"
         self.client = asr_client.AsrClient(cred, "ap-shanghai", clientProfile)
         self.lang = keys.get('lang', 'zh')
+        self.timeout = timeout
 
     def recognize(self, path: PathLike, lang: str = ""):
         if not lang:

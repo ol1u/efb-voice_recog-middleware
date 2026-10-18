@@ -1,5 +1,7 @@
-from typing import Dict
+import threading
+import time
 from io import BytesIO
+from typing import Dict
 
 import pydub
 import requests
@@ -8,10 +10,10 @@ from . import SpeechEngine
 
 
 class BaiduSpeech(SpeechEngine):
-    key_dict: Dict[str, str] = None
-    access_token: str = None
-    full_token = None
     engine_name: str = "Baidu"
+    TOKEN_URL = "https://openapi.baidu.com/oauth/2.0/token"
+    API_URL = "https://vop.baidu.com/server_api"
+    TOKEN_EXPIRY_GRACE_SECONDS = 60
     lang_list = [
         'zh', 'en', 'zh-yue', 'zh-x-en',
         'zh-x-sichuan', 'zh-x-farfield']
@@ -26,20 +28,59 @@ class BaiduSpeech(SpeechEngine):
         "zh-x-farfield": 1936
     }
 
-    def __init__(self, key_dict: Dict[str, str]):
+    def __init__(self, key_dict: Dict[str, str], timeout: float = 20):
         self.key_dict = key_dict
         self.lang = key_dict.get('lang', 'zh')
-        d = {
+        self.timeout = timeout
+        self._token_lock = threading.Lock()
+        self._access_token = None
+        self._token_expires_at = 0
+
+    def _refresh_token(self):
+        data = {
             "grant_type": "client_credentials",
-            "client_id": key_dict['api_key'],
-            "client_secret": key_dict['secret_key']
+            "client_id": self.key_dict['api_key'],
+            "client_secret": self.key_dict['secret_key']
         }
-        r = requests.post(
-            "https://openapi.baidu.com/oauth/2.0/token",
-            data=d
-        ).json()
-        self.access_token: str = r['access_token']
-        self.full_token = r
+        response = requests.post(
+            self.TOKEN_URL,
+            data=data,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise RuntimeError(
+                "Baidu token request failed: {}".format(
+                    token_data.get("error_description")
+                    or token_data.get("error")
+                    or "missing access_token"
+                )
+            )
+        try:
+            expires_in = float(token_data.get("expires_in", 2592000))
+        except (TypeError, ValueError):
+            expires_in = 2592000
+        self._access_token = access_token
+        self._token_expires_at = (
+            time.monotonic()
+            + max(0, expires_in - self.TOKEN_EXPIRY_GRACE_SECONDS)
+        )
+
+    def _get_token(self):
+        if (
+            self._access_token
+            and time.monotonic() < self._token_expires_at
+        ):
+            return self._access_token
+        with self._token_lock:
+            if (
+                not self._access_token
+                or time.monotonic() >= self._token_expires_at
+            ):
+                self._refresh_token()
+            return self._access_token
 
     def recognize(self, file, lang=""):
         if not lang:
@@ -63,11 +104,16 @@ class BaiduSpeech(SpeechEngine):
             }
             params = {
                 "cuid": "catbaron.voice_recog",
-                "token": self.access_token,
+                "token": self._get_token(),
                 "dev_pid": self.languages[lang],
             }
-            r = requests.post("http://vop.baidu.com/server_api",
-                              params=params, headers=headers, data=f)
+            r = requests.post(
+                self.API_URL,
+                params=params,
+                headers=headers,
+                data=f,
+                timeout=self.timeout,
+            )
             if r.status_code != 200:
                 return ["ERROR!", r.status_code, r.content]
             rjson = r.json()

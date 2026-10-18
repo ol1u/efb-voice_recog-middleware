@@ -1,14 +1,15 @@
 # coding: utf-8
 import logging
 import mimetypes
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import suppress
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, List, Optional
 from os import PathLike
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import Any, Dict, Optional, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
-import shutil
 
 from ehforwarderbot import coordinator, Middleware, Message, MsgType
 from ehforwarderbot.utils import get_config_path
@@ -18,7 +19,6 @@ from .engines.azure import AzureSpeech
 from .engines.iflytek import IFlyTekSpeech
 from .engines.tencent import TencentSpeech
 
-import time
 
 class VoiceRecogMiddleware(Middleware):
     """
@@ -34,49 +34,99 @@ class VoiceRecogMiddleware(Middleware):
     logger: logging.Logger = logging.getLogger(
         "plugins.%s.VoiceRecogMiddleware" % middleware_id)
 
-    voice_engines: List = []
+    REQUEST_TIMEOUT = 20
 
     def __init__(self, instance_id: str = None):
-        super().__init__()
-        self.config: Dict[str: Any] = self.load_config()
-        engines: Dict[str, Any] = self.config.get("speech_api", dict())
-        # self.lang: str = self.config.get('language', 'zh')
-
-        if "baidu" in engines:
-            self.voice_engines.append(
-                BaiduSpeech(engines['baidu'])
+        Middleware.__init__(self, instance_id)
+        self.config: Dict[str, Any] = self.load_config()
+        self.voice_engines: List = []
+        engines = self.config.get("speech_api", {})
+        for name, engine_config in engines.items():
+            if not isinstance(engine_config, dict):
+                raise RuntimeError(
+                    'Configuration for "{}" must be a mapping.'.format(name)
                 )
-        if "azure" in engines:
+
+        self.request_timeout = self._timeout_from_config(
+            self.config.get("request_timeout"),
+            self.REQUEST_TIMEOUT,
+        )
+
+        if self._enabled(engines, "baidu"):
             self.voice_engines.append(
-                AzureSpeech(engines['azure'])
+                BaiduSpeech(
+                    engines["baidu"],
+                    timeout=self._engine_timeout(engines, "baidu"),
+                )
             )
-        if "iflytek" in engines:
+        if self._enabled(engines, "azure"):
             self.voice_engines.append(
-                IFlyTekSpeech(engines['iflytek'])
+                AzureSpeech(
+                    engines["azure"],
+                    timeout=self._engine_timeout(engines, "azure"),
+                )
             )
-        if "tencent" in engines:
+        if self._enabled(engines, "iflytek"):
             self.voice_engines.append(
-                TencentSpeech(engines['tencent'])
+                IFlyTekSpeech(
+                    engines["iflytek"],
+                    timeout=self._engine_timeout(engines, "iflytek"),
+                )
+            )
+        if self._enabled(engines, "tencent"):
+            self.voice_engines.append(
+                TencentSpeech(
+                    engines["tencent"],
+                    timeout=self._engine_timeout(engines, "tencent"),
+                )
             )
 
-    def load_config(self) -> Optional[Dict]:
+    @staticmethod
+    def _enabled(engines: Dict[str, Any], name: str) -> bool:
+        config = engines.get(name)
+        return (
+            isinstance(config, dict)
+            and config.get("enabled", True) is not False
+        )
+
+    @staticmethod
+    def _timeout_from_config(value: Any, default: float) -> float:
+        if isinstance(value, bool):
+            return default
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError):
+            return default
+        return timeout if timeout > 0 else default
+
+    def _engine_timeout(self, engines: Dict[str, Any], name: str) -> float:
+        return self._timeout_from_config(
+            engines[name].get("request_timeout"),
+            self.request_timeout,
+        )
+
+    def load_config(self) -> Dict[str, Any]:
         config_path: Path = get_config_path(self.middleware_id)
         if not config_path.exists():
-            raise FileNotFoundError('The configure file does not exist!')
-        with config_path.open('r') as f:
-            d: Dict[str, Any] = yaml.load(f, Loader=yaml.SafeLoader)
-            if not d:
-                raise RuntimeError('Load configure file failed!')
-                return
-            return d
+            raise FileNotFoundError("The configure file does not exist!")
+        with config_path.open("r") as f:
+            data = yaml.load(f, Loader=yaml.SafeLoader)
+            if not isinstance(data, dict) or not data:
+                raise RuntimeError("Load configure file failed!")
+            if not isinstance(data.get("speech_api"), dict):
+                raise RuntimeError('"speech_api" must be a mapping.')
+            return data
 
     def recognize(self, file: PathLike) -> List[str]:
-        '''
+        """
         Recognize the audio file to text.
         :param file: An audio file. It should be FILE object in 'rb'
             mode or string of path to the audio file.
-        '''
-        with ThreadPoolExecutor(max_workers=5) as exe:
+        """
+        if not self.voice_engines:
+            return []
+
+        with ThreadPoolExecutor(max_workers=len(self.voice_engines)) as exe:
             futures = {
                 exe.submit(e.recognize, file): (e.engine_name, e.lang)
                 for e in self.voice_engines
@@ -85,20 +135,42 @@ class VoiceRecogMiddleware(Middleware):
             for future in as_completed(futures):
                 engine_name, lang = futures[future]
                 try:
-                    data = "; ".join(future.result())
+                    parts = future.result()
+                    if not parts:
+                        continue
+                    data = "; ".join(str(part) for part in parts)
+                    # Cloud engines report expected errors as list results
+                    # rather than exceptions. Keep that detail in logs without
+                    # leaking it into the chat text.
+                    if parts[0] == "ERROR!":
+                        if data:
+                            self.logger.warning(
+                                "Voice recognition failed with %s: %s",
+                                engine_name,
+                                data,
+                            )
+                        raise RuntimeError(data or "Unknown error")
+                    if not data.strip():
+                        continue
                     if len(data) > 1000:
                         data = data[:1000] + " ..."
                     if len(self.voice_engines) == 1:
-                        results.append(data.rstrip('。'))
+                        results.append(data.rstrip("。"))
                     else:
-                        results.append(f'\n{engine_name} ({lang}): {data}')
+                        results.append(f"{engine_name} ({lang}): {data}")
                 except Exception as exc:
-                    results.append(f'\n{engine_name} ({lang}): {repr(exc)}')
+                    self.logger.warning(
+                        "Voice recognition failed with %s: %s",
+                        engine_name,
+                        exc,
+                    )
+                    results.append(f"{engine_name} ({lang}): 识别失败")
             return results
 
     @staticmethod
     def sent_by_master(message: Message) -> bool:
-        return message.deliver_to != coordinator.master
+        master = getattr(coordinator, "master", None)
+        return master is not None and message.deliver_to is not master
 
     def process_message(self, message: Message) -> Optional[Message]:
         """
@@ -108,40 +180,49 @@ class VoiceRecogMiddleware(Middleware):
         Returns:
             Optional[:obj:`.Message`]: Processed message or None if discarded.
         """
-        # If sent by slave channel
+        # Only process messages sent by a slave channel.
         if self.sent_by_master(message):
             return message
 
-        # If a voice message
-        try:
-            if message.type != MsgType.Voice:
-                return message
-        except Exception as e:
-            # Unknown error
-            print(f"{e}:, {message.__dict__}")
-            raise e
+        if message.type != MsgType.Voice:
+            return message
 
-        # If any voice engines loaded
         if not self.voice_engines:
             return message
 
-        # Create tmp file for the audio
-        audio: NamedTemporaryFile = NamedTemporaryFile(
-            suffix=mimetypes.guess_extension(message.mime)
-        )
-        shutil.copyfileobj(message.file, audio)
-        audio.seek(0)
-        message.file.seek(0)
-
-        # Voice Recognition
+        audio = None
+        message_file_position = None
         try:
-            result_text: str = '\n'.join(self.recognize(audio.name))
+            if not message.file:
+                return message
+            with suppress(OSError, ValueError):
+                message_file_position = message.file.tell()
+
+            # pydub requires a path. Copy the stream and keep this temporary
+            # file alive until all recognition threads have finished.
+            suffix = mimetypes.guess_extension(message.mime or "") or ""
+            audio = NamedTemporaryFile(suffix=suffix)
+            shutil.copyfileobj(message.file, audio)
+            audio.flush()
+            result_text = "\n".join(self.recognize(audio.name))
         except Exception:
-            result_text = 'Failed to recognize voice content.'
-        if getattr(message, 'text', None) is None:
-            message.text = ""
-        message.text += result_text
+            self.logger.exception(
+                "Failed to prepare or recognize voice content."
+            )
+            result_text = "Failed to recognize voice content."
+        finally:
+            if audio is not None:
+                audio.close()
+            if message.file is not None:
+                try:
+                    message.file.seek(message_file_position or 0)
+                except (OSError, ValueError):
+                    pass
+
+        if message.text:
+            message.text = f"{message.text}\n{result_text}"
+        else:
+            message.text = result_text
         message.text = message.text[:4000]
 
-        # Return message
         return message

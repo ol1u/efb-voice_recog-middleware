@@ -29,7 +29,7 @@ class IFlyTekSpeech(SpeechEngine):
     engine_name = "IFlyTek"
     lang_list = ["zh_cn", "en_us", "zh", "en", "zh-x-sichuan"]
 
-    def __init__(self, keys: Dict[str, str]):
+    def __init__(self, keys: Dict[str, str], timeout: float = 20):
         """
         Arguments:
             keys {Dict[str, str]} -- authorization keys
@@ -37,6 +37,7 @@ class IFlyTekSpeech(SpeechEngine):
         """
         self.keys = keys
         self.lang = keys.get('lang', 'zh_cn')
+        self.timeout = timeout
 
     class IFlyTekSession:
 
@@ -46,7 +47,7 @@ class IFlyTekSpeech(SpeechEngine):
             "zh-x-sichuan": "zh-x-sichuan"
         }
 
-        def __init__(self, keys: Dict[str, str], file, lang):
+        def __init__(self, keys: Dict[str, str], file, lang, timeout: float):
             self.app_id = keys['app_id']
             self.api_secret = keys['api_secret']
             self.api_key = keys['api_key']
@@ -56,6 +57,7 @@ class IFlyTekSpeech(SpeechEngine):
 
             self.file = file
             self.lang = lang
+            self.timeout = timeout
 
             self.is_running = Event()
             self.ws = websocket.WebSocketApp(
@@ -67,16 +69,24 @@ class IFlyTekSpeech(SpeechEngine):
         def run(self):
             Thread(
                 target=self.ws.run_forever,
-                name="iflytek speech websocket listener thread"
+                name="iflytek speech websocket listener thread",
+                daemon=True,
             ).start()
 
-            self.is_running.wait()
-
-            self.send_file(self.file, self.lang)
-
-            self.done.wait()
-
-            self.ws.close()
+            try:
+                if not self.is_running.wait(self.timeout):
+                    raise TimeoutError(
+                        "Timed out while connecting to iFlytek."
+                    )
+                self.send_file(self.file, self.lang)
+                if not self.done.wait(self.timeout):
+                    raise TimeoutError(
+                        "Timed out while waiting for an iFlytek result."
+                    )
+                if self.result.startswith("[Error:"):
+                    raise RuntimeError(self.result)
+            finally:
+                self.ws.close()
 
             return self.result
 
@@ -199,22 +209,30 @@ class IFlyTekSpeech(SpeechEngine):
             self.is_running.set()
 
         def on_message(self, wsapp, message):
-            data = json.loads(message)
-            code = data.get('code', -1)
-            if code != 0:
-                self.result += f"[Error: {data['message']}, {code}]"
-                self.done.set()
-                return
+            try:
+                data = json.loads(message)
+                code = data.get('code', -1)
+                if code != 0:
+                    self.result += (
+                        f"[Error: {data.get('message', 'Unknown error')}, "
+                        f"{code}]"
+                    )
+                    self.done.set()
+                    return
 
-            self.result += ''.join(
-                i['cw'][0]['w'] for i in data['data']['result']['ws']
-                if i.get('cw')
-            )
-            if data['data']['status'] == 2:
+                self.result += ''.join(
+                    i['cw'][0]['w'] for i in data['data']['result']['ws']
+                    if i.get('cw')
+                )
+                if data['data']['status'] == 2:
+                    self.done.set()
+            except (KeyError, TypeError, IndexError, ValueError):
+                self.result += "[Error: Invalid iFlytek response]"
                 self.done.set()
 
         def on_error(self, wsapp, error):
             self.result += f"[Error: {error}]"
+            self.done.set()
 
     def recognize(self, path: PathLike, lang: str = ''):
         if not lang:
@@ -233,4 +251,4 @@ class IFlyTekSpeech(SpeechEngine):
 
             f.seek(0)
 
-            return [self.IFlyTekSession(self.keys, f, lang).run()]
+            return [self.IFlyTekSession(self.keys, f, lang, self.timeout).run()]
