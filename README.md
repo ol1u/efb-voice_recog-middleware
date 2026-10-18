@@ -14,6 +14,7 @@
 6. 所有云端请求都有超时；讯飞连接或回调异常时不会永久等待
 7. 百度 token 按有效期自动刷新，不再依赖重启
 8. 识别失败不再被当作正常识别结果写入消息正文
+9. 腾讯粤语配置使用 `16k_zh-PY` 中英粤混合引擎
 
 ## Installation
 
@@ -44,3 +45,14 @@ speech_api:
 then the top-level value, then the built-in default of 20 seconds. Existing
 configurations without `enabled` keep their original behaviour. An engine is
 loaded only when its section exists and `enabled` is not `false`.
+
+For Tencent Speech, `lang: ca` selects the `16k_zh-PY` engine, which recognises
+Chinese, English, and Cantonese in mixed speech:
+
+```yaml
+speech_api:
+  tencent:
+    secret_id: YOUR_SECRET_ID
+    secret_key: YOUR_SECRET_KEY
+    lang: ca
+```
