@@ -22,7 +22,7 @@ class TencentSpeech(SpeechEngine):
     languages = {
         "zh": "16k",
         "en": "16k_en",
-        "ca": "16k_ca"
+        "ca": "16k_zh-PY"
     }
 
     def __init__(self, keys: Dict[str, str], timeout: float = 20):
